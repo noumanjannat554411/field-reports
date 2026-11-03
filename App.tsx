@@ -7,6 +7,7 @@ import {
   Image,
   Alert,
   StyleSheet,
+  ScrollView,
 } from 'react-native';
 
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -15,68 +16,92 @@ import ImageResizer from '@bam.tech/react-native-image-resizer';
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_URL } from './src/config';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import * as RNFS from '@dr.pogodin/react-native-fs';
 
 const MAX_IMAGE_SIZE = 5_000_000;
 
 export default function App() {
   const [description, setDescription] = useState('');
-  const [image, setImage] = useState<string | null>(null);
+  const [images, setImages] = useState<
+    { uri: string; size: number }[]
+  >([]);
   const [imageSize, setImageSize] = useState<number | null>(null);
 
-  // Select image from gallery
-  async function selectImage() {
+  async function selectImages() {
     const result = await launchImageLibrary({
       mediaType: 'photo',
-      selectionLimit: 1,
+      selectionLimit: 5,
     });
 
-    if (result.didCancel || !result.assets?.[0]?.uri) {
+    if (result.didCancel || !result.assets?.length) {
       return;
     }
 
-    const uri = result.assets[0].uri;
+    const remainingSlots = 5 - images.length;
 
-    // Compress image
-    const resized = await ImageResizer.createResizedImage(
-      uri,
-      1600,
-      1600,
-      'JPEG',
-      80,
-    );
-
-    if (resized.size > MAX_IMAGE_SIZE) {
-      Alert.alert('Image too large', 'Please select a smaller image.');
+    if (remainingSlots <= 0) {
+      Alert.alert('Limit reached', 'You can select up to 5 images.');
       return;
     }
 
-    setImage(resized.uri);
-    setImageSize(resized.size);
+    const selectedAssets = result.assets.slice(0, remainingSlots);
+    const preparedImages: { uri: string; size: number }[] = [];
+    console.log('Selected assets:', selectedAssets);
+
+
+    for (const asset of selectedAssets) {
+      if (!asset.uri) {
+        continue;
+      }
+
+      const resized = await ImageResizer.createResizedImage(
+        asset.uri,
+        1600,
+        1600,
+        'JPEG',
+        80,
+      );
+
+      if (resized.size > 5_000_000) {
+        Alert.alert(
+          'Image too large',
+          'One image is still larger than 5 MB. Please select another image.',
+        );
+        continue;
+      }
+
+      const permanentUri = await saveImagePermanently(resized.path);
+
+      preparedImages.push({
+        uri: permanentUri,
+        size: resized.size,
+      });
+    }
+    console.log('Prepared images:', preparedImages);
+    setImages(previous => [...previous, ...preparedImages]);
   }
 
-  // Save report locally
   async function saveReport() {
     if (!description.trim()) {
       Alert.alert('Error', 'Description is required');
       return;
     }
 
-    if (!image) {
-      Alert.alert('Error', 'Please select an image');
+    if (images.length < 1 || images.length > 5) {
+      Alert.alert('Error', 'Select between 1 and 5 images');
       return;
     }
 
     const report = {
       id: Date.now().toString(),
       description: description.trim(),
-      image,
-      imageSize,
+      images,
       createdAt: new Date().toISOString(),
       status: 'pending',
     };
 
     const existing = await AsyncStorage.getItem('reports');
-
     const reports = existing ? JSON.parse(existing) : [];
 
     reports.push(report);
@@ -86,10 +111,8 @@ export default function App() {
     Alert.alert('Success', 'Report saved locally');
 
     setDescription('');
-    setImage(null);
-    setImageSize(null);
+    setImages([]);
   }
-
 
   async function uploadPendingReports() {
     try {
@@ -101,29 +124,41 @@ export default function App() {
           continue;
         }
 
-        // Step 1: Upload image
-        const formData = new FormData();
+        const uploadedImages = [];
 
-        formData.append('image', {
-          uri: report.image,
-          type: 'image/jpeg',
-          name: 'image.jpg',
-        } as any);
+        // Upload each image one by one
+        for (let index = 0; index < report.images.length; index++) {
+          const image = report.images[index];
 
-        const imageResponse = await fetch(
-          `${API_URL}/reports/${report.id}/images/0`,
-          {
-            method: 'PUT',
-            body: formData,
-          },
-        );
+          const formData = new FormData();
 
-        if (!imageResponse.ok) {
-          throw new Error(`Image upload failed: ${imageResponse.status}`);
+          formData.append('image', {
+            uri: image.uri,
+            type: 'image/jpeg',
+            name: `image-${index}.jpg`,
+          } as any);
+
+          const response = await fetch(
+            `${API_URL}/reports/${report.id}/images/${index}`,
+            {
+              method: 'PUT',
+              body: formData,
+            },
+          );
+
+          const result = await response.json();
+
+          if (!response.ok) {
+            throw new Error(JSON.stringify(result));
+          }
+
+          uploadedImages.push({
+            index,
+            size: result.size,
+          });
         }
-        const imageData = JSON.parse(await imageResponse.text());
-        console.log('Image upload response:', imageData);
-        // Step 2: Commit report
+
+        // Commit report after all images are uploaded
         const commitResponse = await fetch(
           `${API_URL}/reports/${report.id}/commit`,
           {
@@ -134,64 +169,103 @@ export default function App() {
             body: JSON.stringify({
               description: report.description,
               createdAt: report.createdAt,
-              images: [
-                {
-                  index: 0,
-                  size: imageData.size,
-                },
-              ],
+              images: uploadedImages,
             }),
           },
         );
 
+        const commitResult = await commitResponse.json();
+
         if (!commitResponse.ok) {
-          console.log('Commit response:', await commitResponse.text());
-          throw new Error(`Report commit failed: ${commitResponse.status}`);
+          throw new Error(JSON.stringify(commitResult));
         }
 
-        // Step 3: Mark report as uploaded
         report.status = 'uploaded';
 
         await AsyncStorage.setItem(
           'reports',
           JSON.stringify(reports),
         );
+
+        console.log('Report uploaded:', report.id);
       }
 
-      Alert.alert('Success', 'Pending reports uploaded successfully');
+      Alert.alert('Success', 'All pending reports uploaded');
     } catch (error) {
       console.log('Upload error:', error);
       Alert.alert('Upload failed', String(error));
     }
   }
+  async function saveImagePermanently(sourcePath: string): Promise<string> {
+    const directoryPath = `${RNFS.DocumentDirectoryPath}/report-images`;
 
+    const directoryExists = await RNFS.exists(directoryPath);
+
+    if (!directoryExists) {
+      await RNFS.mkdir(directoryPath);
+    }
+
+    const fileName = `report-${Date.now()}-${Math.random()
+      .toString(36)
+      .substring(2)}.jpg`;
+
+    const destinationPath = `${directoryPath}/${fileName}`;
+
+    await RNFS.copyFile(sourcePath, destinationPath);
+
+    return `file://${destinationPath}`;
+  }
   return (
-    <View style={styles.container}>
-      <Text style={styles.heading}>Field Reports</Text>
+    <SafeAreaView>
+      <ScrollView>
+        <View style={styles.container}>
+          <Text style={styles.heading}>Field Reports</Text>
 
-      <TextInput
-        style={styles.input}
-        placeholder="Enter report description"
-        value={description}
-        onChangeText={setDescription}
-        multiline
-      />
+          <TextInput
+            style={styles.input}
+            placeholder="Enter report description"
+            value={description}
+            onChangeText={setDescription}
+            multiline
+          />
 
-      <Button title="Select Image" onPress={selectImage} />
-      <Button
-        title="Upload Pending Reports"
-        onPress={uploadPendingReports}
-      />
+          <Button
+            title={`Select Images (${images.length}/5)`}
+            onPress={selectImages}
+          />
+          <Button
+            title="Upload Pending Reports"
+            onPress={uploadPendingReports}
+          />
 
-      {image && (
-        <Image
-          source={{ uri: image }}
-          style={styles.image}
-        />
-      )}
+          <View style={styles.imageContainer}>
+            {images.map((item, index) => (
+              <View key={`${item.uri}-${index}`}>
+                <Image
+                  source={{ uri: item.uri }}
+                  style={styles.image}
+                />
 
-      <Button title="Save Report" onPress={saveReport} />
-    </View>
+                <Text>
+                  Image {index + 1} — {(item.size / 1024).toFixed(1)} KB
+                </Text>
+
+                <Button
+                  title="Remove"
+                  onPress={() => {
+                    setImages(previous =>
+                      previous.filter((_, i) => i !== index),
+                    );
+                  }}
+                />
+              </View>
+            ))}
+          </View>
+
+          <Button title="Save Report" onPress={saveReport} />
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -214,6 +288,10 @@ const styles = StyleSheet.create({
     height: 100,
     marginBottom: 20,
     textAlignVertical: 'top',
+  },
+  imageContainer: {
+    marginVertical: 15,
+    gap: 15,
   },
   image: {
     width: 150,
