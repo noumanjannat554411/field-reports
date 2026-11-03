@@ -117,7 +117,9 @@ export function createApp({ store, chaos, log = console.log }) {
   // client-generated id: repeating it returns the existing report.
   api.post('/:id/commit', express.json({ limit: '64kb' }), (req, res) => {
     const { id } = req.params;
+    console.log("commit request for id:", id, "body:", req.body);
     const existing = store.getReport(id);
+    console.log("id:", id, "existing:", existing);
     if (existing) {
       return res.status(200).json({ status: 'exists', report: toPublic(existing) });
     }
@@ -129,6 +131,7 @@ export function createApp({ store, chaos, log = console.log }) {
     if (description.length > MAX_DESCRIPTION) {
       return res.status(400).json({ error: 'description is too long' });
     }
+    console.log("description:", description, "createdAt:", createdAt, "images:", images);
     if (
       !Array.isArray(images) ||
       images.length < MIN_IMAGES ||
