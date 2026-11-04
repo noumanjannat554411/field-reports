@@ -91,6 +91,7 @@ export default function App() {
       }
 
       const data = await response.json();
+      console.log('Fetched server reports:', data.reports);
 
       setServerReports(data.reports || []);
     } catch (error) {
@@ -610,6 +611,65 @@ export default function App() {
 
     return `file://${destinationPath}`;
   }
+  const getServerImageUrl = (imageUrl: string) => {
+    return `${API_URL}${imageUrl}`;
+  };
+  const resetLocalData = () => {
+    Alert.alert(
+      'Reset Local Data',
+      'This will permanently delete all local reports and their images, including pending uploads. Server reports will not be affected. Continue?',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Reset',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // Prevent reset while uploads are running
+              if (uploadInProgress.current) {
+                Alert.alert(
+                  'Upload in Progress',
+                  'Please wait until the current upload finishes.',
+                );
+                return;
+              }
+
+              // Delete local report images
+              const imageDirectory =
+                `${RNFS.DocumentDirectoryPath}/report-images`;
+
+              if (await RNFS.exists(imageDirectory)) {
+                await RNFS.unlink(imageDirectory);
+              }
+
+              // Delete locally saved reports
+              await AsyncStorage.removeItem('reports');
+
+              // Clear retry tracking
+              retryAttempts.current = {};
+              nextRetryAt.current = {};
+
+              // Clear UI
+              setReports([]);
+              setImages([]);
+              setDescription('');
+
+              Alert.alert(
+                'Reset Complete',
+                'All local reports and images have been deleted.',
+              );
+            } catch (error) {
+              console.log('Reset failed:', error);
+              Alert.alert('Error', 'Unable to reset local data.');
+            }
+          },
+        },
+      ],
+    );
+  };
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
       <View style={styles.header}>
@@ -720,25 +780,47 @@ export default function App() {
           <FlatList
             data={serverReports}
             keyExtractor={item => String(item.id)}
+            contentContainerStyle={{ paddingBottom: 30 }}
             renderItem={({ item }) => (
               <View style={styles.reportCard}>
                 <Text style={styles.reportDescription}>
                   {item.description}
                 </Text>
 
-                <Text>Report ID: {item.id}</Text>
-                <Text>Status: Uploaded</Text>
-                <Text>Created: {item.createdAt}</Text>
+                <Text style={styles.reportDetail}>
+                  Report ID: {item.id}
+                </Text>
 
-                <Text>
+                <Text style={styles.reportDetail}>
+                  Status: Uploaded
+                </Text>
+
+                <Text style={styles.reportDetail}>
+                  Created: {new Date(item.createdAt).toLocaleString()}
+                </Text>
+
+                <Text style={styles.reportDetail}>
                   Images: {item.images?.length || 0}
                 </Text>
+
+                <View style={styles.imageContainer}>
+                  {item.images?.map(
+                    (image: { index: number; size: number; url: string }) => (
+                      <Image
+                        key={`${item.id}-${image.index}`}
+                        source={{ uri: getServerImageUrl(image.url) }}
+                        style={styles.serverImage}
+                        resizeMode="cover"
+                      />
+                    ),
+                  )}
+                </View>
               </View>
             )}
             ListEmptyComponent={
-              <Text>
+              <Text style={styles.emptyText}>
                 {loadingServerReports
-                  ? 'Loading reports...'
+                  ? 'Loading server reports...'
                   : 'No server reports found'}
               </Text>
             }
@@ -847,6 +929,13 @@ export default function App() {
               }}
             />
           )}
+          <TouchableOpacity
+            style={styles.resetButton}
+            onPress={resetLocalData}>
+            <Text style={styles.resetButtonText}>
+              Reset Local Data
+            </Text>
+          </TouchableOpacity>
         </View>
       )}
     </SafeAreaView>
@@ -886,6 +975,21 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: 'bold',
     marginBottom: 8,
+  },
+  resetButton: {
+    backgroundColor: '#DC2626',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 12,
+  },
+
+  resetButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
   },
   header: {
     flexDirection: 'row',
@@ -988,5 +1092,23 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
     lineHeight: 21,
+  },
+  reportDetail: {
+    fontSize: 13,
+    color: '#6B7280',
+    marginTop: 5,
+  },
+
+  serverImage: {
+    width: 100,
+    height: 100,
+    borderRadius: 8,
+    backgroundColor: '#E5E7EB',
+  },
+
+  emptyText: {
+    textAlign: 'center',
+    color: '#6B7280',
+    marginTop: 30,
   },
 });
