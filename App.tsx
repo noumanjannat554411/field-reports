@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,8 @@ import {
   Alert,
   StyleSheet,
   ScrollView,
+  FlatList,
+  TouchableOpacity,
 } from 'react-native';
 
 import { launchImageLibrary } from 'react-native-image-picker';
@@ -18,16 +20,78 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_URL } from './src/config';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as RNFS from '@dr.pogodin/react-native-fs';
+import NetInfo from '@react-native-community/netinfo';
 
 const MAX_IMAGE_SIZE = 5_000_000;
 
 export default function App() {
+  const [currentScreen, setCurrentScreen] = useState<'create' | 'reports'>('create');
   const [description, setDescription] = useState('');
   const [images, setImages] = useState<
     { uri: string; size: number }[]
   >([]);
-  const [imageSize, setImageSize] = useState<number | null>(null);
+  const [reports, setReports] = useState<any[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<
+    Record<string, {
+      uploaded: number;
+      total: number;
+      currentImage: number;
+      status: string;
+    }>
+  >({});
+  const uploadInProgress = useRef(false);
+  const retryAttempts = useRef(0);
+  const nextRetryAt = useRef(0);
+  useEffect(() => {
+    console.log('Current screen changed to:', currentScreen);
+  }, [currentScreen]);
+  useEffect(() => {
+    const checkConnection = async () => {
+      const state = await NetInfo.fetch();
 
+      if (state.isConnected && state.isInternetReachable !== false) {
+        uploadPendingReports();
+      }
+    };
+
+    checkConnection();
+  }, []);
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      const connected =
+        state.isConnected === true &&
+        state.isInternetReachable !== false;
+
+      console.log('Internet connected:', connected);
+
+      if (connected) {
+        uploadPendingReports();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+  useEffect(() => {
+    if (currentScreen === 'reports') {
+      loadReports();
+    }
+  }, [currentScreen]);
+  async function loadReports() {
+    try {
+      const storedReports = await AsyncStorage.getItem('reports');
+
+      const parsedReports = storedReports
+        ? JSON.parse(storedReports)
+        : [];
+      console.log('Loaded reports:', parsedReports);
+
+      setReports(parsedReports);
+    } catch (error) {
+      console.log('Error loading reports:', error);
+    }
+  }
   async function selectImages() {
     const result = await launchImageLibrary({
       mediaType: 'photo',
@@ -63,7 +127,7 @@ export default function App() {
         80,
       );
 
-      if (resized.size > 5_000_000) {
+      if (resized.size > MAX_IMAGE_SIZE) {
         Alert.alert(
           'Image too large',
           'One image is still larger than 5 MB. Please select another image.',
@@ -108,92 +172,285 @@ export default function App() {
 
     await AsyncStorage.setItem('reports', JSON.stringify(reports));
 
+    setReports(reports);
+    uploadPendingReports();
     Alert.alert('Success', 'Report saved locally');
 
     setDescription('');
     setImages([]);
   }
+  function getRetryAfterMs(response: Response): number | null {
+    const retryAfter = response.headers.get('Retry-After');
 
+    if (!retryAfter) {
+      return null;
+    }
+
+    // Backend sends seconds, for example: 5
+    const seconds = Number(retryAfter);
+
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000;
+    }
+
+    // Also support HTTP date format
+    const retryDate = new Date(retryAfter).getTime();
+
+    if (!Number.isNaN(retryDate)) {
+      return Math.max(0, retryDate - Date.now());
+    }
+
+    return null;
+  }
   async function uploadPendingReports() {
+    if (uploadInProgress.current) {
+      return;
+    }
+    if (Date.now() < nextRetryAt.current) {
+      return;
+    }
+    uploadInProgress.current = true;
+
     try {
       const storedReports = await AsyncStorage.getItem('reports');
       const reports = storedReports ? JSON.parse(storedReports) : [];
 
       for (const report of reports) {
-        if (report.status === 'uploaded') {
+        // Skip reports that are already uploaded
+        if (
+          report.status === 'uploaded' ||
+          report.status === 'failed'
+        ) {
           continue;
         }
 
-        const uploadedImages = [];
+        try {
+          const uploadedImages = [];
+          const totalImages = report.images.length;
 
-        // Upload each image one by one
-        for (let index = 0; index < report.images.length; index++) {
-          const image = report.images[index];
+          setUploadProgress(previous => ({
+            ...previous,
+            [report.id]: {
+              uploaded: 0,
+              total: totalImages,
+              currentImage: 1,
+              status: 'uploading',
+            },
+          }));
 
-          const formData = new FormData();
+          // Upload each image one by one
+          for (let index = 0; index < totalImages; index++) {
+            const image = report.images[index];
 
-          formData.append('image', {
-            uri: image.uri,
-            type: 'image/jpeg',
-            name: `image-${index}.jpg`,
-          } as any);
+            const formData = new FormData();
 
-          const response = await fetch(
-            `${API_URL}/reports/${report.id}/images/${index}`,
+            formData.append(
+              'image',
+              {
+                uri: image.uri,
+                type: 'image/jpeg',
+                name: `image-${index}.jpg`,
+              } as any,
+            );
+
+            const response = await fetch(
+              `${API_URL}/reports/${report.id}/images/${index}`,
+              {
+                method: 'PUT',
+                body: formData,
+              },
+            );
+
+            const result = await response.json().catch(() => ({
+              error: 'Invalid server response',
+            }));
+
+            if (!response.ok) {
+              const error = new Error(JSON.stringify(result));
+              (error as any).status = response.status;
+              (error as any).retryAfterMs = getRetryAfterMs(response);
+              throw error;
+            }
+
+            uploadedImages.push({
+              index,
+              size: result.size,
+            });
+
+            // Update upload progress
+            setUploadProgress(previous => ({
+              ...previous,
+              [report.id]: {
+                uploaded: uploadedImages.length,
+                total: totalImages,
+                currentImage: Math.min(index + 2, totalImages),
+                status: 'uploading',
+              },
+            }));
+          }
+
+          // All images uploaded. Now commit the report.
+          setUploadProgress(previous => ({
+            ...previous,
+            [report.id]: {
+              uploaded: totalImages,
+              total: totalImages,
+              currentImage: totalImages,
+              status: 'committing',
+            },
+          }));
+
+          const commitResponse = await fetch(
+            `${API_URL}/reports/${report.id}/commit`,
             {
-              method: 'PUT',
-              body: formData,
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                description: report.description,
+                createdAt: report.createdAt,
+                images: uploadedImages,
+              }),
             },
           );
 
-          const result = await response.json();
-
-          if (!response.ok) {
-            throw new Error(JSON.stringify(result));
+          const commitResult = await commitResponse.json().catch(() => ({
+            error: 'Invalid server response',
+          }));
+          if (!commitResponse.ok) {
+            const error = new Error(JSON.stringify(commitResult));
+            (error as any).status = commitResponse.status;
+            (error as any).retryAfterMs = getRetryAfterMs(commitResponse);
+            throw error;
           }
 
-          uploadedImages.push({
-            index,
-            size: result.size,
-          });
-        }
+          // Mark report as uploaded
+          report.status = 'uploaded';
+          retryAttempts.current = 0;
+          nextRetryAt.current = 0;
+          // Save updated reports locally
+          await AsyncStorage.setItem(
+            'reports',
+            JSON.stringify(reports),
+          );
 
-        // Commit report after all images are uploaded
-        const commitResponse = await fetch(
-          `${API_URL}/reports/${report.id}/commit`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
+          setReports([...reports]);
+
+          setUploadProgress(previous => ({
+            ...previous,
+            [report.id]: {
+              uploaded: totalImages,
+              total: totalImages,
+              currentImage: totalImages,
+              status: 'completed',
             },
-            body: JSON.stringify({
-              description: report.description,
-              createdAt: report.createdAt,
-              images: uploadedImages,
-            }),
-          },
-        );
+          }));
 
-        const commitResult = await commitResponse.json();
+          console.log('Report uploaded:', report.id);
+        } catch (error) {
+          const status = (error as any)?.status;
 
-        if (!commitResponse.ok) {
-          throw new Error(JSON.stringify(commitResult));
+          console.log(`Upload failed for report ${report.id}:`, error);
+
+          // Permanent client errors should not be retried automatically.
+          const isPermanentError =
+            typeof status === 'number' &&
+            status >= 400 &&
+            status < 500 &&
+            status !== 408 &&
+            status !== 429;
+
+          if (isPermanentError) {
+            console.log(`Permanent error: HTTP ${status}`);
+
+            report.status = 'failed';
+
+            await AsyncStorage.setItem('reports', JSON.stringify(reports));
+            setReports([...reports]);
+
+            setUploadProgress(previous => ({
+              ...previous,
+              [report.id]: {
+                ...previous[report.id],
+                status: 'failed',
+              },
+            }));
+
+            break;
+          }
+
+          // Retry temporary errors and network failures.
+          retryAttempts.current += 1;
+
+          const serverRetryDelay = (error as any)?.retryAfterMs;
+
+          const delay =
+            typeof serverRetryDelay === 'number'
+              ? serverRetryDelay
+              : Math.min(
+                1000 * Math.pow(2, retryAttempts.current - 1),
+                30000,
+              );
+
+          nextRetryAt.current = Date.now() + delay;
+
+          console.log(`Retrying in ${delay / 1000} seconds`);
+
+          setUploadProgress(previous => ({
+            ...previous,
+            [report.id]: {
+              ...previous[report.id],
+              status: 'failed',
+            },
+          }));
+
+          // Stop processing further reports until the retry.
+          break;
         }
-
-        report.status = 'uploaded';
-
-        await AsyncStorage.setItem(
-          'reports',
-          JSON.stringify(reports),
-        );
-
-        console.log('Report uploaded:', report.id);
       }
-
-      Alert.alert('Success', 'All pending reports uploaded');
     } catch (error) {
-      console.log('Upload error:', error);
-      Alert.alert('Upload failed', String(error));
+      // This catch handles errors outside the individual report uploads,
+      // such as reading or parsing AsyncStorage.
+      console.log('Error loading pending reports:', error);
+    } finally {
+      uploadInProgress.current = false;
+
+      if (nextRetryAt.current > Date.now()) {
+        const remainingDelay = nextRetryAt.current - Date.now();
+
+        setTimeout(() => {
+          uploadPendingReports();
+        }, remainingDelay);
+      }
+    }
+  }
+
+  async function retryReport(reportId: string) {
+    try {
+      const storedReports = await AsyncStorage.getItem('reports');
+      const reports = storedReports ? JSON.parse(storedReports) : [];
+
+      const updatedReports = reports.map((report: any) =>
+        report.id === reportId
+          ? { ...report, status: 'pending' }
+          : report,
+      );
+
+      await AsyncStorage.setItem(
+        'reports',
+        JSON.stringify(updatedReports),
+      );
+
+      setReports(updatedReports);
+
+      // Reset retry delay so manual retry starts immediately.
+      retryAttempts.current = 0;
+      nextRetryAt.current = 0;
+
+      uploadPendingReports();
+    } catch (error) {
+      console.log('Manual retry failed:', error);
     }
   }
   async function saveImagePermanently(sourcePath: string): Promise<string> {
@@ -216,55 +473,174 @@ export default function App() {
     return `file://${destinationPath}`;
   }
   return (
-    <SafeAreaView>
-      <ScrollView>
-        <View style={styles.container}>
-          <Text style={styles.heading}>Field Reports</Text>
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
+      <View style={styles.header}>
+        <Button
+          title="Create Report"
+          onPress={() => setCurrentScreen('create')}
+        />
 
-          <TextInput
-            style={styles.input}
-            placeholder="Enter report description"
-            value={description}
-            onChangeText={setDescription}
-            multiline
-          />
+        <Button
+          title="My Reports"
+          onPress={() => setCurrentScreen('reports')}
+        />
+      </View>
+      {currentScreen === 'create' ? (
 
-          <Button
-            title={`Select Images (${images.length}/5)`}
-            onPress={selectImages}
-          />
-          <Button
-            title="Upload Pending Reports"
-            onPress={uploadPendingReports}
-          />
+        <ScrollView>
+          <View>
+            {/* Your existing Create Report UI goes here */}
+            <View style={styles.container}>
 
-          <View style={styles.imageContainer}>
-            {images.map((item, index) => (
-              <View key={`${item.uri}-${index}`}>
-                <Image
-                  source={{ uri: item.uri }}
-                  style={styles.image}
-                />
+              <Text style={styles.heading}>Field Reports</Text>
 
-                <Text>
-                  Image {index + 1} — {(item.size / 1024).toFixed(1)} KB
-                </Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Enter report description"
+                value={description}
+                onChangeText={setDescription}
+                multiline
+              />
 
-                <Button
-                  title="Remove"
-                  onPress={() => {
-                    setImages(previous =>
-                      previous.filter((_, i) => i !== index),
-                    );
-                  }}
-                />
+              <Button
+                title={`Select Images (${images.length}/5)`}
+                onPress={selectImages}
+              />
+              <Button
+                title="Upload Pending Reports"
+                onPress={uploadPendingReports}
+              />
+
+              <View style={styles.imageContainer}>
+                {images.map((image, index) => (
+                  <View key={`${image.uri}-${index}`} style={styles.imageWrapper}>
+                    <Image
+                      source={{ uri: image.uri }}
+                      style={styles.image}
+                    />
+
+                    <TouchableOpacity
+                      style={styles.removeImageButton}
+                      onPress={() => {
+                        setImages(currentImages =>
+                          currentImages.filter((_, i) => i !== index),
+                        );
+                      }}>
+                      <Text style={styles.removeImageText}>×</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
               </View>
-            ))}
-          </View>
 
-          <Button title="Save Report" onPress={saveReport} />
+              <Button title="Save Report" onPress={saveReport} />
+            </View>
+          </View>
+        </ScrollView>
+      ) : (
+        <View style={styles.container}>
+          <Text style={styles.title}>My Reports</Text>
+
+          {reports.length === 0 ? (
+            <Text style={styles.noReportsText}>No reports found.</Text>
+          ) : (
+            <FlatList
+              data={reports}
+              keyExtractor={item => item.id}
+              renderItem={({ item }) => {
+                console.log('Rendering report:', item);
+                return (
+                  <View style={styles.reportCard}>
+                    <Text style={styles.reportDescription}>
+                      {item.description}
+                    </Text>
+
+                    <Text>
+                      Images: {item.images?.length ?? 0}
+                    </Text>
+
+                    <Text>
+                      Created: {new Date(item.createdAt).toLocaleString()}
+                    </Text>
+
+                    <Text
+                      style={{
+                        color: item.status === 'uploaded' ? 'green' : 'orange',
+                      }}>
+                      Status: {item.status === 'uploaded' ? 'Uploaded' : 'Pending'}
+                    </Text>
+                    {item.status === 'failed' && (
+                      <TouchableOpacity
+                        onPress={() => retryReport(item.id)}
+                        style={{
+                          backgroundColor: '#2563EB',
+                          padding: 10,
+                          borderRadius: 8,
+                          marginTop: 10,
+                        }}>
+                        <Text style={{ color: '#FFFFFF', textAlign: 'center' }}>
+                          Retry Upload
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                    {uploadProgress[item.id] && (
+                      <View style={{ marginTop: 12 }}>
+                        <Text>
+                          Images uploaded: {uploadProgress[item.id].uploaded}/
+                          {uploadProgress[item.id].total}
+                        </Text>
+
+                        <Text>
+                          Images remaining: {
+                            uploadProgress[item.id].total -
+                            uploadProgress[item.id].uploaded
+                          }
+                        </Text>
+
+                        <View
+                          style={{
+                            height: 10,
+                            backgroundColor: '#ddd',
+                            borderRadius: 5,
+                            marginTop: 8,
+                            overflow: 'hidden',
+                          }}>
+                          <View
+                            style={{
+                              height: 10,
+                              width: `${(uploadProgress[item.id].uploaded /
+                                uploadProgress[item.id].total) * 100
+                                }%`,
+                              backgroundColor: '#16A34A',
+                            }}
+                          />
+                        </View>
+
+                        <Text>
+                          {uploadProgress[item.id].status === 'committing'
+                            ? 'Finalizing report...'
+                            : uploadProgress[item.id].status === 'completed'
+                              ? 'Upload completed'
+                              : `Uploading image ${uploadProgress[item.id].currentImage}`}
+                        </Text>
+                      </View>
+                    )}
+
+                    <View style={styles.imageContainer}>
+                      {item.images?.map((image: any, index: number) => (
+                        <Image
+                          key={`${item.id}-${index}`}
+                          source={{ uri: image.uri }}
+                          style={styles.image}
+                        />
+                      ))}
+                    </View>
+                  </View>
+                )
+              }}
+            />
+          )}
         </View>
-      </ScrollView>
+      )}
     </SafeAreaView>
   );
 }
@@ -274,6 +650,39 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 20,
     justifyContent: 'center',
+    backgroundColor: '#F9FAFB',
+  },
+
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 16,
+    color: 'black',
+  },
+  noReportsText: {
+    fontSize: 18,
+    color: '#555',
+    textAlign: 'center',
+    marginTop: 20,
+  },
+
+  reportCard: {
+    padding: 15,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 10,
+  },
+
+  reportDescription: {
+    fontSize: 17,
+    fontWeight: 'bold',
+    marginBottom: 8,
+  },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginBottom: 20,
   },
   heading: {
     fontSize: 25,
@@ -290,13 +699,53 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
   },
   imageContainer: {
-    marginVertical: 15,
-    gap: 15,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 10,
   },
   image: {
     width: 150,
     height: 150,
     marginVertical: 20,
     borderRadius: 10,
+  },
+  progressBackground: {
+    height: 10,
+    backgroundColor: '#ddd',
+    borderRadius: 5,
+    marginTop: 8,
+    overflow: 'hidden',
+  },
+
+  progressFill: {
+    height: 10,
+    backgroundColor: '#16A34A',
+    borderRadius: 5,
+  },
+
+  imageWrapper: {
+    position: 'relative',
+  },
+
+
+  removeImageButton: {
+    position: 'absolute',
+    top: -8,
+    right: -8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: 'red',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 1,
+  },
+
+  removeImageText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+    lineHeight: 21,
   },
 });

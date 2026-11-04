@@ -1,3 +1,3 @@
 import {Platform} from 'react-native';
 
-export const API_URL = 'https://b356-182-188-86-197.ngrok-free.app';
+export const API_URL = 'https://0f70-2402-ad80-1f9-9d18-e410-b00e-1a68-66ef.ngrok-free.app';
