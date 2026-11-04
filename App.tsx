@@ -12,7 +12,7 @@ import {
   TouchableOpacity,
 } from 'react-native';
 
-import { launchImageLibrary } from 'react-native-image-picker';
+import { launchImageLibrary, launchCamera } from 'react-native-image-picker';
 
 import ImageResizer from '@bam.tech/react-native-image-resizer';
 
@@ -25,12 +25,14 @@ import NetInfo from '@react-native-community/netinfo';
 const MAX_IMAGE_SIZE = 5_000_000;
 
 export default function App() {
-  const [currentScreen, setCurrentScreen] = useState<'create' | 'reports'>('create');
+  const [currentScreen, setCurrentScreen] = useState<'create' | 'reports' | 'server'>('create');
   const [description, setDescription] = useState('');
   const [images, setImages] = useState<
     { uri: string; size: number }[]
   >([]);
   const [reports, setReports] = useState<any[]>([]);
+  const [serverReports, setServerReports] = useState<any[]>([]);
+  const [loadingServerReports, setLoadingServerReports] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<
     Record<string, {
       uploaded: number;
@@ -40,8 +42,8 @@ export default function App() {
     }>
   >({});
   const uploadInProgress = useRef(false);
-  const retryAttempts = useRef(0);
-  const nextRetryAt = useRef(0);
+  const retryAttempts = useRef<Record<string, number>>({});
+  const nextRetryAt = useRef<Record<string, number>>({});
   useEffect(() => {
     console.log('Current screen changed to:', currentScreen);
   }, [currentScreen]);
@@ -78,6 +80,26 @@ export default function App() {
       loadReports();
     }
   }, [currentScreen]);
+  const fetchServerReports = async () => {
+    try {
+      setLoadingServerReports(true);
+
+      const response = await fetch(`${API_URL}/reports`);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      setServerReports(data.reports || []);
+    } catch (error) {
+      console.log('Failed to fetch server reports:', error);
+      Alert.alert('Error', 'Unable to fetch server reports');
+    } finally {
+      setLoadingServerReports(false);
+    }
+  };
   async function loadReports() {
     try {
       const storedReports = await AsyncStorage.getItem('reports');
@@ -145,6 +167,77 @@ export default function App() {
     console.log('Prepared images:', preparedImages);
     setImages(previous => [...previous, ...preparedImages]);
   }
+  const openCamera = async () => {
+    try {
+      if (images.length >= 5) {
+        Alert.alert('Limit reached', 'Maximum 5 images allowed');
+        return;
+      }
+
+      const result = await launchCamera({
+        mediaType: 'photo',
+        cameraType: 'back',
+        quality: 1,
+        saveToPhotos: false,
+      });
+
+      if (result.didCancel) {
+        return;
+      }
+
+      if (result.errorCode) {
+        Alert.alert(
+          'Camera Error',
+          result.errorMessage || result.errorCode,
+        );
+        return;
+      }
+
+      const asset = result.assets?.[0];
+
+      if (!asset?.uri) {
+        return;
+      }
+
+      // Compress the captured image
+      const resized = await ImageResizer.createResizedImage(
+        asset.uri,
+        1600,
+        1600,
+        'JPEG',
+        80,
+      );
+
+      if (resized.size > MAX_IMAGE_SIZE) {
+        Alert.alert('Error', 'Image must be less than 5 MB');
+        return;
+      }
+
+      // Save permanently inside app storage
+      const permanentUri = await saveImagePermanently(resized.uri);
+
+      // Add image to existing images
+      setImages(currentImages => {
+        if (currentImages.length >= 5) {
+          return currentImages;
+        }
+
+        return [
+          ...currentImages,
+          {
+            uri: permanentUri,
+            fileName: `camera-${Date.now()}.jpg`,
+            type: 'image/jpeg',
+            fileSize: resized.size,
+          },
+        ];
+      });
+
+    } catch (error) {
+      console.log('Camera error:', error);
+      Alert.alert('Error', 'Unable to capture image');
+    }
+  };
 
   async function saveReport() {
     if (!description.trim()) {
@@ -206,11 +299,8 @@ export default function App() {
     if (uploadInProgress.current) {
       return;
     }
-    if (Date.now() < nextRetryAt.current) {
-      return;
-    }
     uploadInProgress.current = true;
-
+    let nextScheduledRetryAt = 0;
     try {
       const storedReports = await AsyncStorage.getItem('reports');
       const reports = storedReports ? JSON.parse(storedReports) : [];
@@ -221,6 +311,20 @@ export default function App() {
           report.status === 'uploaded' ||
           report.status === 'failed'
         ) {
+          continue;
+        }
+
+        // Check whether this particular report is ready for retry.
+        const retryTime = nextRetryAt.current[report.id] || 0;
+
+        if (Date.now() < retryTime) {
+          if (
+            nextScheduledRetryAt === 0 ||
+            retryTime < nextScheduledRetryAt
+          ) {
+            nextScheduledRetryAt = retryTime;
+          }
+
           continue;
         }
 
@@ -261,9 +365,29 @@ export default function App() {
               },
             );
 
-            const result = await response.json().catch(() => ({
-              error: 'Invalid server response',
-            }));
+            // const result = await response.json().catch(() => ({
+            //   error: 'Invalid server response',
+            // }));
+
+            const responseText = await response.text();
+
+            console.log('Image upload response:', {
+              status: response.status,
+              body: responseText,
+            });
+
+            let result;
+
+            try {
+              result = JSON.parse(responseText);
+            } catch {
+              const error = new Error(
+                `Invalid server response: HTTP ${response.status}`,
+              );
+
+              (error as any).status = response.status;
+              throw error;
+            }
 
             if (!response.ok) {
               const error = new Error(JSON.stringify(result));
@@ -327,8 +451,8 @@ export default function App() {
 
           // Mark report as uploaded
           report.status = 'uploaded';
-          retryAttempts.current = 0;
-          nextRetryAt.current = 0;
+          delete retryAttempts.current[report.id];
+          delete nextRetryAt.current[report.id];
           // Save updated reports locally
           await AsyncStorage.setItem(
             'reports',
@@ -381,7 +505,8 @@ export default function App() {
           }
 
           // Retry temporary errors and network failures.
-          retryAttempts.current += 1;
+          retryAttempts.current[report.id] =
+            (retryAttempts.current[report.id] || 0) + 1;
 
           const serverRetryDelay = (error as any)?.retryAfterMs;
 
@@ -389,13 +514,25 @@ export default function App() {
             typeof serverRetryDelay === 'number'
               ? serverRetryDelay
               : Math.min(
-                1000 * Math.pow(2, retryAttempts.current - 1),
+                1000 * Math.pow(
+                  2,
+                  retryAttempts.current[report.id] - 1,
+                ),
                 30000,
               );
 
-          nextRetryAt.current = Date.now() + delay;
+          nextRetryAt.current[report.id] = Date.now() + delay;
+          const scheduledTime = Date.now() + delay;
 
-          console.log(`Retrying in ${delay / 1000} seconds`);
+          if (
+            nextScheduledRetryAt === 0 ||
+            scheduledTime < nextScheduledRetryAt
+          ) {
+            nextScheduledRetryAt = scheduledTime;
+          }
+          console.log(
+            `Retrying report ${report.id} in ${delay / 1000} seconds`,
+          );
 
           setUploadProgress(previous => ({
             ...previous,
@@ -406,7 +543,7 @@ export default function App() {
           }));
 
           // Stop processing further reports until the retry.
-          break;
+          continue;
         }
       }
     } catch (error) {
@@ -416,8 +553,9 @@ export default function App() {
     } finally {
       uploadInProgress.current = false;
 
-      if (nextRetryAt.current > Date.now()) {
-        const remainingDelay = nextRetryAt.current - Date.now();
+      if (nextScheduledRetryAt > Date.now()) {
+        const remainingDelay =
+          nextScheduledRetryAt - Date.now();
 
         setTimeout(() => {
           uploadPendingReports();
@@ -445,8 +583,8 @@ export default function App() {
       setReports(updatedReports);
 
       // Reset retry delay so manual retry starts immediately.
-      retryAttempts.current = 0;
-      nextRetryAt.current = 0;
+      delete retryAttempts.current[reportId];
+      delete nextRetryAt.current[reportId];
 
       uploadPendingReports();
     } catch (error) {
@@ -475,15 +613,29 @@ export default function App() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
       <View style={styles.header}>
-        <Button
-          title="Create Report"
-          onPress={() => setCurrentScreen('create')}
-        />
 
-        <Button
-          title="My Reports"
-          onPress={() => setCurrentScreen('reports')}
-        />
+        <TouchableOpacity
+          style={styles.tabContainer}
+          onPress={() => {
+            setCurrentScreen('create');
+          }}>
+          <Text style={styles.tabText}>Create Report</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.tabContainer}
+          onPress={() => {
+            setCurrentScreen('reports');
+          }}>
+          <Text style={styles.tabText}>My Reports</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.tabContainer}
+          onPress={() => {
+            setCurrentScreen('server');
+            fetchServerReports();
+          }}>
+          <Text style={styles.tabText}>Server Reports</Text>
+        </TouchableOpacity>
       </View>
       {currentScreen === 'create' ? (
 
@@ -502,15 +654,33 @@ export default function App() {
                 multiline
               />
 
-              <Button
+              {/* <Button
                 title={`Select Images (${images.length}/5)`}
                 onPress={selectImages}
               />
               <Button
                 title="Upload Pending Reports"
                 onPress={uploadPendingReports}
-              />
+              /> */}
+              <View style={{ flexDirection: 'row', gap: 10 }}>
 
+                <TouchableOpacity
+                  style={[styles.button, { flex: 1 }]}
+                  onPress={openCamera}>
+                  <Text style={styles.buttonText}>
+                    Take Photo
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.button, { flex: 1 }]}
+                  onPress={selectImages}>
+                  <Text style={styles.buttonText}>
+                    Select Gallery
+                  </Text>
+                </TouchableOpacity>
+
+              </View>
               <View style={styles.imageContainer}>
                 {images.map((image, index) => (
                   <View key={`${image.uri}-${index}`} style={styles.imageWrapper}>
@@ -536,6 +706,44 @@ export default function App() {
             </View>
           </View>
         </ScrollView>
+      ) : currentScreen === 'server' ? (
+        <View style={{ flex: 1, padding: 20 }}>
+          <TouchableOpacity
+            style={styles.button}
+            onPress={fetchServerReports}
+            disabled={loadingServerReports}>
+            <Text style={styles.buttonText}>
+              {loadingServerReports ? 'Loading...' : 'Refresh'}
+            </Text>
+          </TouchableOpacity>
+
+          <FlatList
+            data={serverReports}
+            keyExtractor={item => String(item.id)}
+            renderItem={({ item }) => (
+              <View style={styles.reportCard}>
+                <Text style={styles.reportDescription}>
+                  {item.description}
+                </Text>
+
+                <Text>Report ID: {item.id}</Text>
+                <Text>Status: Uploaded</Text>
+                <Text>Created: {item.createdAt}</Text>
+
+                <Text>
+                  Images: {item.images?.length || 0}
+                </Text>
+              </View>
+            )}
+            ListEmptyComponent={
+              <Text>
+                {loadingServerReports
+                  ? 'Loading reports...'
+                  : 'No server reports found'}
+              </Text>
+            }
+          />
+        </View>
       ) : (
         <View style={styles.container}>
           <Text style={styles.title}>My Reports</Text>
@@ -683,6 +891,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-around',
     marginBottom: 20,
+    elevation: 2,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 10,
   },
   heading: {
     fontSize: 25,
@@ -697,6 +908,36 @@ const styles = StyleSheet.create({
     height: 100,
     marginBottom: 20,
     textAlignVertical: 'top',
+  },
+  tabContainer: {
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 8,
+
+  },
+  tabText: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  button: {
+    backgroundColor: '#2563EB',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 8,
+  },
+
+  buttonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   imageContainer: {
     flexDirection: 'row',
