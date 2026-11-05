@@ -44,6 +44,7 @@ export default function App() {
   const uploadInProgress = useRef(false);
   const retryAttempts = useRef<Record<string, number>>({});
   const nextRetryAt = useRef<Record<string, number>>({});
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     console.log('Current screen changed to:', currentScreen);
   }, [currentScreen]);
@@ -296,11 +297,35 @@ export default function App() {
 
     return null;
   }
+  async function fetchWithTimeout(
+    url: string,
+    options: RequestInit,
+    timeoutMs = 20000,
+  ): Promise<Response> {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      return await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
   async function uploadPendingReports() {
     if (uploadInProgress.current) {
       return;
     }
     uploadInProgress.current = true;
+    if (retryTimer.current) {
+      clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
     let nextScheduledRetryAt = 0;
     try {
       const storedReports = await AsyncStorage.getItem('reports');
@@ -357,14 +382,22 @@ export default function App() {
                 name: `image-${index}.jpg`,
               } as any,
             );
-
-            const response = await fetch(
+            const response = await fetchWithTimeout(
               `${API_URL}/reports/${report.id}/images/${index}`,
               {
                 method: 'PUT',
                 body: formData,
               },
+              20000,
             );
+
+            // const response = await fetch(
+            //   `${API_URL}/reports/${report.id}/images/${index}`,
+            //   {
+            //     method: 'PUT',
+            //     body: formData,
+            //   },
+            // );
 
             // const result = await response.json().catch(() => ({
             //   error: 'Invalid server response',
@@ -425,7 +458,7 @@ export default function App() {
             },
           }));
 
-          const commitResponse = await fetch(
+          const commitResponse = await fetchWithTimeout(
             `${API_URL}/reports/${report.id}/commit`,
             {
               method: 'POST',
@@ -502,7 +535,7 @@ export default function App() {
               },
             }));
 
-            break;
+            continue;
           }
 
           // Retry temporary errors and network failures.
@@ -554,11 +587,14 @@ export default function App() {
     } finally {
       uploadInProgress.current = false;
 
-      if (nextScheduledRetryAt > Date.now()) {
-        const remainingDelay =
-          nextScheduledRetryAt - Date.now();
+      if (nextScheduledRetryAt > 0) {
+        const remainingDelay = Math.max(
+          100,
+          nextScheduledRetryAt - Date.now(),
+        );
 
-        setTimeout(() => {
+        retryTimer.current = setTimeout(() => {
+          retryTimer.current = null;
           uploadPendingReports();
         }, remainingDelay);
       }
